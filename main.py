@@ -3,6 +3,7 @@ import json
 import re
 import time
 from typing import List, Optional, Tuple
+from urllib.parse import parse_qs, urlparse
 
 import requests
 import streamlit as st
@@ -36,6 +37,94 @@ def is_supported_video(filename: str, mime_type: str) -> bool:
     extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
     mime_ok = mime_type.startswith("video/") if mime_type else False
     return extension in SUPPORTED_EXTENSIONS and mime_ok
+
+
+def extract_youtube_video_id(url: str) -> Optional[str]:
+    """Extract a YouTube video id from common watch/share/embed URL formats."""
+    if not url:
+        return None
+
+    raw = url.strip()
+    if not raw:
+        return None
+    if not raw.startswith(("http://", "https://")):
+        raw = f"https://{raw}"
+
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return None
+
+    host = (parsed.netloc or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+
+    video_id = None
+    if host == "youtu.be":
+        video_id = parsed.path.strip("/").split("/")[0]
+    elif host in {"youtube.com", "m.youtube.com", "music.youtube.com"}:
+        path = (parsed.path or "").strip("/")
+        if path == "watch":
+            video_id = parse_qs(parsed.query or "").get("v", [None])[0]
+        elif path.startswith("shorts/"):
+            video_id = path.split("/", 1)[1].split("/")[0]
+        elif path.startswith("embed/"):
+            video_id = path.split("/", 1)[1].split("/")[0]
+
+    if not video_id:
+        return None
+
+    video_id = video_id.strip()
+    if re.fullmatch(r"[\w-]{11}", video_id):
+        return video_id
+    return None
+
+
+def is_youtube_url(url: str) -> bool:
+    """Validate YouTube URL by checking whether a video id can be extracted."""
+    return extract_youtube_video_id(url) is not None
+
+
+def fetch_youtube_video_title(youtube_url: str) -> Optional[str]:
+    """Fetch a YouTube video title using oEmbed endpoint (no API key required)."""
+    try:
+        endpoint = "https://www.youtube.com/oembed"
+        response = requests.get(
+            endpoint,
+            params={"url": youtube_url, "format": "json"},
+            timeout=8,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        title = str(payload.get("title", "")).strip() if isinstance(payload, dict) else ""
+        return title or None
+    except requests.exceptions.RequestException:
+        return None
+    except Exception:
+        return None
+
+
+def derive_song_query_from_video_title(video_title: str) -> str:
+    """Convert a YouTube video title into a probable song query."""
+    title = (video_title or "").strip()
+    if not title:
+        return ""
+
+    # Remove common non-song tags.
+    title = re.sub(r"\[[^\]]*(official|video|lyrics?|audio|mv|hd|4k)[^\]]*\]", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\([^\)]*(official|video|lyrics?|audio|mv|hd|4k)[^\)]*\)", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\s+", " ", title).strip(" -|")
+
+    # Prefer the track segment when title is in Artist - Track format.
+    for sep in (" - ", " | ", " : "):
+        if sep in title:
+            parts = [p.strip() for p in title.split(sep) if p.strip()]
+            if len(parts) >= 2:
+                title = parts[-1]
+                break
+
+    title = re.sub(r"\s+", " ", title).strip(" -|")
+    return title
 
 
 # -----------------------------
@@ -492,6 +581,221 @@ def build_overlay_html(
     """
 
 
+def build_youtube_overlay_html(
+    youtube_video_id: str,
+    lines: List[str],
+    seconds_per_line: float,
+    synced_cues: Optional[List[Tuple[float, str]]] = None,
+) -> str:
+    """Build kinetic typography lyric overlay player for YouTube videos."""
+    overlay_cues = _build_overlay_cues(lines, seconds_per_line, synced_cues=synced_cues)
+    cues_json = json.dumps(overlay_cues)
+
+    return f"""
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=Bangers&display=swap');
+
+      * {{
+        box-sizing: border-box;
+      }}
+
+      .overlay-wrap {{
+        position: relative;
+        width: min(1320px, 98vw);
+        margin: 1rem auto 1.25rem auto;
+        border-radius: 16px;
+        overflow: hidden;
+        box-shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
+        background: linear-gradient(180deg, #0e1624, #090c12);
+      }}
+
+      .overlay-video {{
+        width: 100%;
+        aspect-ratio: 16 / 9;
+        background: #000;
+      }}
+
+      .overlay-video iframe {{
+        width: 100%;
+        height: 100%;
+      }}
+
+      .kinetic-layer {{
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        pointer-events: none;
+        padding: 0 4vw;
+      }}
+
+      .lyric-pill {{
+        position: relative;
+        width: 40vw;
+        max-width: 760px;
+        min-width: 280px;
+        text-align: center;
+        font-family: 'Bangers', 'Segoe UI', sans-serif;
+        font-weight: 400;
+        line-height: 1.22;
+        font-size: clamp(1.65rem, 4.2vw, 3.7rem);
+        color: #d1d5db;
+        letter-spacing: 0.03em;
+        text-shadow: 0 8px 30px rgba(0, 0, 0, 0.56);
+      }}
+
+      .lyric-pill::before {{
+        content: "";
+        position: absolute;
+        inset: -18px -26px;
+        border-radius: 22px;
+        background: rgba(5, 10, 20, 0.24);
+        backdrop-filter: blur(10px) saturate(120%);
+        -webkit-backdrop-filter: blur(10px) saturate(120%);
+        z-index: -1;
+      }}
+
+      .word {{
+        display: inline-block;
+        margin: 0 0.14em;
+        transform-origin: 50% 60%;
+        transition: color 220ms ease, transform 220ms ease, text-shadow 220ms ease;
+      }}
+
+      .word.active {{
+        color: #6b7280;
+        transform: scale(1.05);
+        text-shadow: 0 0 18px rgba(17, 24, 39, 0.42), 0 0 4px rgba(0, 0, 0, 0.58);
+      }}
+    </style>
+
+    <div class="overlay-wrap">
+      <div id="ytPlayer" class="overlay-video"></div>
+      <div class="kinetic-layer">
+        <div id="lyricLine" class="lyric-pill"></div>
+      </div>
+    </div>
+
+    <script>
+      const cues = {cues_json};
+      const lineEl = document.getElementById("lyricLine");
+      const ytVideoId = {json.dumps(youtube_video_id)};
+      let player = null;
+      let rafId = null;
+
+      function esc(str) {{
+        return str.replace(/&/g, "&amp;")
+                  .replace(/</g, "&lt;")
+                  .replace(/>/g, "&gt;");
+      }}
+
+      function findCueIndex(t) {{
+        for (let i = 0; i < cues.length; i += 1) {{
+          if (t >= cues[i].start && t < cues[i].end) return i;
+        }}
+        return cues.length ? cues.length - 1 : -1;
+      }}
+
+      function renderCue(cue, t) {{
+        const text = (cue.text || "").trim();
+        if (!text) {{
+          lineEl.innerHTML = "";
+          return;
+        }}
+
+        const words = text.split(/\\s+/).filter(Boolean);
+        if (!words.length) {{
+          lineEl.innerHTML = esc(text);
+          return;
+        }}
+
+        const duration = Math.max(0.15, cue.end - cue.start);
+        const progress = Math.min(0.999, Math.max(0, (t - cue.start) / duration));
+        const activeIdx = Math.min(words.length - 1, Math.floor(progress * words.length));
+
+        lineEl.innerHTML = words
+          .map((w, idx) => `<span class="word ${{idx === activeIdx ? "active" : ""}}">${{esc(w)}}</span>`)
+          .join(" ");
+      }}
+
+      function currentTime() {{
+        if (!player || typeof player.getCurrentTime !== "function") return 0;
+        return Number(player.getCurrentTime()) || 0;
+      }}
+
+      function tick() {{
+        const t = currentTime();
+        const idx = findCueIndex(t);
+        if (idx >= 0) renderCue(cues[idx], t);
+        rafId = window.requestAnimationFrame(tick);
+      }}
+
+      function stopTicking() {{
+        if (rafId) {{
+          window.cancelAnimationFrame(rafId);
+          rafId = null;
+        }}
+      }}
+
+      function onPlayerReady() {{
+        const idx = findCueIndex(currentTime());
+        if (idx >= 0) renderCue(cues[idx], currentTime());
+      }}
+
+      function onPlayerStateChange(event) {{
+        if (!window.YT || !window.YT.PlayerState) return;
+        if (event.data === window.YT.PlayerState.PLAYING) {{
+          if (!rafId) tick();
+        }} else {{
+          stopTicking();
+          const t = currentTime();
+          const idx = findCueIndex(t);
+          if (idx >= 0) renderCue(cues[idx], t);
+        }}
+      }}
+
+      function initPlayer() {{
+        if (player || !window.YT || !window.YT.Player) return;
+        player = new window.YT.Player("ytPlayer", {{
+          videoId: ytVideoId,
+          width: "100%",
+          height: "100%",
+          playerVars: {{
+            playsinline: 1,
+            rel: 0,
+            modestbranding: 1
+          }},
+          events: {{
+            onReady: onPlayerReady,
+            onStateChange: onPlayerStateChange
+          }}
+        }});
+      }}
+
+      (function boot() {{
+        const prevReady = window.onYouTubeIframeAPIReady;
+        window.onYouTubeIframeAPIReady = function () {{
+          if (typeof prevReady === "function") prevReady();
+          initPlayer();
+        }};
+
+        if (window.YT && window.YT.Player) {{
+          initPlayer();
+          return;
+        }}
+
+        const existing = document.querySelector('script[src="https://www.youtube.com/iframe_api"]');
+        if (!existing) {{
+          const tag = document.createElement("script");
+          tag.src = "https://www.youtube.com/iframe_api";
+          document.head.appendChild(tag);
+        }}
+      }})();
+    </script>
+    """
+
+
 # -----------------------------
 # Streamlit UI
 # -----------------------------
@@ -526,23 +830,37 @@ st.markdown(
       }
     </style>
     <div class="app-title">Music Video Lyrics Overlay</div>
-    <div class="app-sub">Upload a video, enter the exact song name, and play with synchronized lyric captions.</div>
+    <div class="app-sub">Upload a video, enter a song name (or auto-detect), and play with synchronized lyric captions.</div>
     """,
     unsafe_allow_html=True,
 )
 
 # Inputs required by prompt
-uploaded_video = st.file_uploader(
-    "Upload a music video",
-    type=list(SUPPORTED_EXTENSIONS),
-    accept_multiple_files=False,
-    help="Supported: MP4, MOV, WEBM, M4V, OGG",
+video_source = st.radio(
+    "Video source",
+    options=["Upload from local storage", "YouTube URL"],
+    horizontal=True,
 )
+
+uploaded_video = None
+youtube_url = ""
+if video_source == "Upload from local storage":
+    uploaded_video = st.file_uploader(
+        "Upload a music video",
+        type=list(SUPPORTED_EXTENSIONS),
+        accept_multiple_files=False,
+        help="Supported: MP4, MOV, WEBM, M4V, OGG",
+    )
+else:
+    youtube_url = st.text_input(
+        "YouTube video URL",
+        placeholder="https://www.youtube.com/watch?v=...",
+    ).strip()
 
 song_name = st.text_input(
     "Song name",
     placeholder="Example: Blinding Lights",
-    help="Use the exact song title for best matching.",
+    help="For YouTube URLs, leave blank to auto-derive from video title when possible.",
 )
 
 run_btn = st.button("Fetch Lyrics + Build Overlay", type="primary")
@@ -556,7 +874,9 @@ with st.expander("API details and configuration", expanded=False):
   - `GET https://api.lyrics.ovh/v1/<artist>/<title>`
 - **Fallback lyrics API:** `lrclib.net` (public API)
   - `GET https://lrclib.net/api/search?q=<song_name>`
-- **API key required:** No (for both providers)
+- **YouTube title lookup (for blank song input):** `youtube oEmbed`
+  - `GET https://www.youtube.com/oembed?url=<youtube_url>&format=json`
+- **API key required:** No (for all providers)
 - **Configuration:** None required. The app calls public endpoints directly with automatic retry + fallback.
 - **Timestamped sync:** When available, the app uses `syncedLyrics` (LRC timestamps) from `lrclib`.
         """
@@ -566,35 +886,61 @@ if run_btn:
     # -----------------------------
     # Error handling for empty inputs
     # -----------------------------
-    if not uploaded_video:
+    using_uploaded_video = video_source == "Upload from local storage"
+    using_youtube_url = video_source == "YouTube URL"
+    youtube_video_id = extract_youtube_video_id(youtube_url) if using_youtube_url else None
+
+    if using_uploaded_video and not uploaded_video:
         st.error("Please upload a video file.")
         st.stop()
+    if using_youtube_url and not youtube_url:
+        st.error("Please enter a YouTube URL.")
+        st.stop()
+    if using_youtube_url and not youtube_video_id:
+        st.error("Please enter a valid YouTube watch/share URL.")
+        st.stop()
 
-    if not song_name or not song_name.strip():
-        st.error("Please enter the song name.")
+    song_query = (song_name or "").strip()
+    if using_youtube_url and not song_query:
+        with st.spinner("Reading video title from YouTube URL..."):
+            video_title = fetch_youtube_video_title(youtube_url)
+        if video_title:
+            inferred_query = derive_song_query_from_video_title(video_title)
+            if inferred_query:
+                song_query = inferred_query
+                st.info(f'Inferred song query from video title "{video_title}": {song_query}')
+
+    if not song_query:
+        if using_uploaded_video:
+            st.error("Please enter the song name.")
+        else:
+            st.error("Please enter the song name, or use a YouTube URL with a readable video title.")
         st.stop()
 
     # -----------------------------
     # Error handling for invalid format
     # -----------------------------
-    if not is_supported_video(uploaded_video.name, uploaded_video.type):
-        st.error(
-            "Unsupported video format. Please upload a valid video file (MP4, MOV, WEBM, M4V, OGG)."
-        )
-        st.stop()
+    video_bytes = b""
+    video_mime = "video/mp4"
+    if using_uploaded_video:
+        if not is_supported_video(uploaded_video.name, uploaded_video.type):
+            st.error(
+                "Unsupported video format. Please upload a valid video file (MP4, MOV, WEBM, M4V, OGG)."
+            )
+            st.stop()
 
-    video_bytes = uploaded_video.getvalue()
+        video_bytes = uploaded_video.getvalue()
+        video_mime = uploaded_video.type or "video/mp4"
+        if not video_bytes:
+            st.error("Uploaded video appears to be empty or unreadable.")
+            st.stop()
 
-    if not video_bytes:
-        st.error("Uploaded video appears to be empty or unreadable.")
-        st.stop()
-
-    # Built-in Streamlit video display (requested)
-    st.video(video_bytes)
+        # Built-in Streamlit video display (requested)
+        st.video(video_bytes)
 
     with st.spinner("Looking up song and fetching lyrics..."):
         try:
-            lyrics_text, matched_title, matched_artist = find_and_fetch_lyrics(song_name.strip())
+            lyrics_text, matched_title, matched_artist = find_and_fetch_lyrics(song_query)
         except requests.exceptions.Timeout:
             st.error("Lyrics providers timed out after retries. Please try again in a moment.")
             st.stop()
@@ -616,7 +962,7 @@ if run_btn:
         synced_cues = []
         try:
             synced_lrc = fetch_synced_lyrics_lrc(
-                song_name.strip(),
+                song_query,
                 preferred_title=matched_title,
                 preferred_artist=matched_artist,
             )
@@ -635,15 +981,6 @@ if run_btn:
         st.stop()
 
     # If the file is too large, avoid building enormous inlined HTML payload.
-    size_mb = len(video_bytes) / (1024 * 1024)
-    if size_mb > MAX_OVERLAY_FILE_MB:
-        st.warning(
-            f"Video is {size_mb:.1f} MB. Overlay player is disabled above {MAX_OVERLAY_FILE_MB} MB to keep the app stable."
-        )
-        st.info("Lyrics preview:")
-        st.code("\n".join(lines[:30]) + ("\n..." if len(lines) > 30 else ""))
-        st.stop()
-
     st.success(f"Matched: {matched_title} - {matched_artist}")
     if synced_cues:
         st.info(f"Using timestamped lyrics sync ({len(synced_cues)} timed cues from lrclib).")
@@ -652,22 +989,44 @@ if run_btn:
             f"Timestamped lyrics not available. Falling back to fixed interval ({FALLBACK_SECONDS_PER_LINE:.2f}s per line)."
         )
 
-    # -----------------------------
-    # Render custom overlay block
-    # -----------------------------
-    overlay_html = build_overlay_html(
-        video_mime=uploaded_video.type or "video/mp4",
-        video_bytes=video_bytes,
-        lines=lines,
-        seconds_per_line=FALLBACK_SECONDS_PER_LINE,
-        synced_cues=synced_cues,
-    )
+    if using_uploaded_video:
+        size_mb = len(video_bytes) / (1024 * 1024)
+        if size_mb > MAX_OVERLAY_FILE_MB:
+            st.warning(
+                f"Video is {size_mb:.1f} MB. Overlay player is disabled above {MAX_OVERLAY_FILE_MB} MB to keep the app stable."
+            )
+            st.info("Lyrics preview:")
+            st.code("\n".join(lines[:30]) + ("\n..." if len(lines) > 30 else ""))
+            st.stop()
 
-    st.markdown("### Overlay Player")
-    st.markdown(
-        "Play the video below to view kinetic typography synced over the video.",
-    )
-    components.html(overlay_html, height=860, scrolling=False)
+        # -----------------------------
+        # Render custom overlay block
+        # -----------------------------
+        overlay_html = build_overlay_html(
+            video_mime=video_mime,
+            video_bytes=video_bytes,
+            lines=lines,
+            seconds_per_line=FALLBACK_SECONDS_PER_LINE,
+            synced_cues=synced_cues,
+        )
+
+        st.markdown("### Overlay Player")
+        st.markdown(
+            "Play the video below to view kinetic typography synced over the video.",
+        )
+        components.html(overlay_html, height=860, scrolling=False)
+    else:
+        overlay_html = build_youtube_overlay_html(
+            youtube_video_id=youtube_video_id,
+            lines=lines,
+            seconds_per_line=FALLBACK_SECONDS_PER_LINE,
+            synced_cues=synced_cues,
+        )
+        st.markdown("### Overlay Player")
+        st.markdown(
+            "Play the YouTube video below to view kinetic typography synced over the video.",
+        )
+        components.html(overlay_html, height=860, scrolling=False)
 
     # Optional raw lyrics block
     with st.expander("Show full fetched lyrics", expanded=False):
@@ -675,6 +1034,6 @@ if run_btn:
 
 else:
     st.markdown(
-        '<div class="note">Upload a file and enter a song title, then click <b>Fetch Lyrics + Build Overlay</b>.</div>',
+        '<div class="note">Choose local upload or YouTube URL, enter a song title (optional for YouTube), then click <b>Fetch Lyrics + Build Overlay</b>.</div>',
         unsafe_allow_html=True,
     )
