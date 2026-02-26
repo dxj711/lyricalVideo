@@ -859,7 +859,7 @@ else:
 
 song_name = st.text_input(
     "Song name",
-    placeholder="Example: Blinding Lights",
+    placeholder="Optional",
     help="For YouTube URLs, leave blank to auto-derive from video title when possible.",
 )
 
